@@ -1,0 +1,12 @@
+pymilvus[model]
+langchain
+langchain-community
+langchain-text-splitters
+sentence-transformers
+pypdf
+openai
+ragas
+datasets
+langchain-openai
+langchain-huggingface
+
