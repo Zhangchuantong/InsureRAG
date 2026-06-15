@@ -78,7 +78,7 @@ Qwen3-8B-AWQ 基于完整父条款生成答案
 | Context Recall | 1.0000 | 19/22 |
 | 平均端到端延迟 | 4.95 秒 | 22/22 |
 
-部分 Faithfulness 和 Context Recall 样本因本地裁判模型 4096 Token 上下文限制未得到有效分数，因此相关均值仅基于有效样本。
+上述结果采集时裁判模型上下文为 4096 Token，部分 Faithfulness 和 Context Recall 样本因此未得到有效分数。当前部署已调整为 8192 Token，重新评测后应以最新结果为准。
 
 对应文件：`stage6_evaluate.py`
 
@@ -119,7 +119,7 @@ docker run --gpus all --name vllm-qwen3-8b-awq \
   --model Qwen/Qwen3-8B-AWQ \
   --trust-remote-code \
   --gpu-memory-utilization 0.85 \
-  --max-model-len 4096
+  --max-model-len 8192
 ```
 
 Windows PowerShell 中需要根据本机环境调整换行符和 Hugging Face 缓存路径。
@@ -160,4 +160,3 @@ python stage6_evaluate.py
 - 尚未对父条款重复召回进行去重，较长条款可能重复占用 Top K。
 - Query Rewrite 尚未接入主问答和评测链路。
 - 评测集规模较小，指标仅用于项目迭代，不代表生产环境效果。
-
