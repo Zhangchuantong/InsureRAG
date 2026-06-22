@@ -1,135 +1,195 @@
 # -*- coding: utf-8 -*-
-"""
-阶段 2：embedding + 入库 Milvus Lite
-================================================
-对应简历技术点：
-  - "使用 bge-m3 对文档同时生成稠密向量与稀疏向量，分别存储，支持混合检索"
-  - "设计多集合存储策略"（这里先做单集合，多集合在注释里说明怎么扩展）
+"""Stage 2: embed chunks and insert them into Milvus Standalone."""
 
-核心思路（面试要点）：
-  bge-m3 的杀手锏：一个模型同时输出
-    - dense（稠密向量）：捕捉语义相似（"能赔吗"≈"是否承担给付责任"）
-    - sparse（稀疏向量，类似 BM25）：捕捉关键词精确匹配（"等待期""既往症"这种术语）
-  保险问答里两者缺一不可：术语必须精确命中，口语化又必须靠语义。
-  所以把两种向量都存进 Milvus，检索时各查一路再融合（见 stage3）。
+from __future__ import annotations
 
-  为什么用 Milvus 而不是 FAISS：
-    - 原生支持稀疏向量 + 稠密向量的混合检索（hybrid_search）
-    - 支持多集合（collection），天然适合按险种隔离
-    - Milvus Lite 本地零部署，开发期就能用，上线可平滑切到 Milvus 集群
-"""
-
-import os
 import json
-import pickle
+import os
+import sys
+from pathlib import Path
 
-from pymilvus import (
-    MilvusClient, DataType, Function, FunctionType,
-)
-from pymilvus.model.hybrid import BGEM3EmbeddingFunction
+from pymilvus import DataType, MilvusClient
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-CHUNKS_PATH = os.path.join(DATA_DIR, "chunks.json")
-DB_PATH = os.path.join(DATA_DIR, "insure_rag.db")   # Milvus Lite 数据文件
-CACHE_PATH = os.path.join(DATA_DIR, "retrieval_cache.pkl")
-COLLECTION = "policy_clauses"                         # 集合名（多险种时可建多个）
+from config.settings import settings
+from observability.ingestion_trace import update_ingestion_trace
+from vectorstore.milvus_client import forget_collection
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
+PROJECT_DIR = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_DIR / "data"
+CHUNKS_PATH = DATA_DIR / "chunks.json"
+VECTOR_DB_URI = settings.milvus_uri
+COLLECTION = settings.vector_db["collection"]
+
+
+def configure_hf_offline() -> None:
+    if bool(settings.embedding.get("local_files_only", True)):
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 
 def get_embedding_model():
-    """加载 bge-m3。首次会自动下载模型（约 2GB），耐心等。
-    use_fp16=False 兼容 CPU；有 GPU 可设 device='cuda', use_fp16=True 提速。
-    """
-    print("【阶段2】加载 bge-m3（首次需下载模型）…")
-    return BGEM3EmbeddingFunction(use_fp16=False, device="cpu")
+    print(f"【阶段2】加载 embedding 模型：{settings.embedding['model_path']}")
+    configure_hf_offline()
+    from pymilvus.model.hybrid import BGEM3EmbeddingFunction
+
+    return BGEM3EmbeddingFunction(
+        model_name=settings.embedding["model_path"],
+        use_fp16=bool(settings.embedding["use_fp16"]),
+        device=settings.embedding["device"],
+        local_files_only=bool(settings.embedding.get("local_files_only", True)),
+    )
 
 
-def build_collection(client: MilvusClient, dense_dim: int):
-    """建集合：定义字段(field)与索引(index)。
+# Per-field VARCHAR byte limits. parent_text is raised to the Milvus ceiling
+# (65535) because OCR'd documents without clean "第X条" boundaries can produce a
+# single very large parent block. Milvus measures VARCHAR length in bytes, so the
+# write path truncates by UTF-8 byte length to stay within these limits.
+VARCHAR_LIMITS = {
+    "collection_name": 128,
+    "document_id": 256,
+    "document_type": 128,
+    "source": 512,
+    "clause_id": 256,
+    "parent_id": 256,
+    "child_text": 8000,
+    "parent_text": 65535,
+}
 
-    字段设计就是简历里"结合数据特点设计 field 和 index"：
-      - id           主键
-      - child_text   子块原文（检索用）
-      - parent_text  父块原文（喂大模型用）
-      - source       来源，可做过滤
-      - dense_vector 稠密向量
-      - sparse_vector 稀疏向量
-    """
-    if client.has_collection(COLLECTION):
-        client.drop_collection(COLLECTION)  # 重跑时清空，方便调试
+
+def _truncate_utf8(text: object, max_bytes: int) -> str:
+    encoded = str(text).encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return str(text)
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def build_collection(client: MilvusClient, dense_dim: int, collection_name: str = COLLECTION) -> None:
+    # NOTE: rebuild-style ingestion. Every run drops and recreates the whole
+    # collection, so re-running stage2 re-indexes all documents from scratch and
+    # does NOT support incremental per-document insert/update/delete. This keeps
+    # the demo simple; production multi-document ingestion would need upsert by
+    # document_id and partial re-indexing instead.
+    if client.has_collection(collection_name):
+        client.drop_collection(collection_name)
 
     schema = client.create_schema(auto_id=False, enable_dynamic_field=True)
     schema.add_field("id", DataType.INT64, is_primary=True)
-    schema.add_field("child_text", DataType.VARCHAR, max_length=2000)
-    schema.add_field("parent_text", DataType.VARCHAR, max_length=8000)
-    schema.add_field("source", DataType.VARCHAR, max_length=256)
+    schema.add_field("collection_name", DataType.VARCHAR, max_length=VARCHAR_LIMITS["collection_name"])
+    schema.add_field("document_id", DataType.VARCHAR, max_length=VARCHAR_LIMITS["document_id"])
+    schema.add_field("document_type", DataType.VARCHAR, max_length=VARCHAR_LIMITS["document_type"])
+    schema.add_field("source", DataType.VARCHAR, max_length=VARCHAR_LIMITS["source"])
+    schema.add_field("page", DataType.INT64)
+    schema.add_field("clause_id", DataType.VARCHAR, max_length=VARCHAR_LIMITS["clause_id"])
+    schema.add_field("parent_id", DataType.VARCHAR, max_length=VARCHAR_LIMITS["parent_id"])
+    schema.add_field("child_text", DataType.VARCHAR, max_length=VARCHAR_LIMITS["child_text"])
+    schema.add_field("parent_text", DataType.VARCHAR, max_length=VARCHAR_LIMITS["parent_text"])
     schema.add_field("dense_vector", DataType.FLOAT_VECTOR, dim=dense_dim)
     schema.add_field("sparse_vector", DataType.SPARSE_FLOAT_VECTOR)
 
-    # 索引：稠密用 IP（内积，bge 向量已归一化，IP≈cosine）；稀疏用专用索引
-    # index_params = client.prepare_index_params()
-    # index_params.add_index(
-    #     field_name="dense_vector",
-    #     index_type="AUTOINDEX",
-    #     metric_type="IP",
-    # )
-    # index_params.add_index(
-    #     field_name="sparse_vector",
-    #     index_type="SPARSE_INVERTED_INDEX",
-    #     metric_type="IP",
-    # )
-
-    # client.create_collection(
-    #     collection_name=COLLECTION,
-    #     schema=schema,
-    #     index_params=index_params,
-    # )
-    client.create_collection(
-        collection_name=COLLECTION,
-        schema=schema,
+    index_params = client.prepare_index_params()
+    index_params.add_index(
+        field_name="dense_vector",
+        index_type="AUTOINDEX",
+        metric_type="IP",
     )
-    print(f"  集合 {COLLECTION} 创建完成（稠密维度={dense_dim}）")
+    index_params.add_index(
+        field_name="sparse_vector",
+        index_type="SPARSE_INVERTED_INDEX",
+        metric_type="IP",
+    )
+
+    client.create_collection(
+        collection_name=collection_name,
+        schema=schema,
+        index_params=index_params,
+    )
+    # the collection was just dropped+recreated; invalidate the search pool's
+    # load cache so the next query loads the fresh collection.
+    forget_collection(collection_name)
+    print(f"  collection 创建完成：{collection_name}，dense_dim={dense_dim}")
 
 
-def main():
-    with open(CHUNKS_PATH, "r", encoding="utf-8") as f:
-        chunks = json.load(f)
-    print(f"【阶段2】读取 {len(chunks)} 个子块")
+def _document_ids(chunks: list[dict]) -> list[str]:
+    return sorted({str(chunk.get("document_id", chunk.get("source", "document"))) for chunk in chunks})
 
+
+def _mark_documents(document_ids: list[str], **updates) -> None:
+    for document_id in document_ids:
+        update_ingestion_trace(document_id, **updates)
+
+
+def _row_from_chunk(chunk: dict, dense_vector, sparse_vector) -> dict:
+    def field(name: str, value: object) -> str:
+        return _truncate_utf8(value, VARCHAR_LIMITS[name])
+
+    return {
+        "id": int(chunk["id"]),
+        "collection_name": field("collection_name", chunk.get("collection_name", COLLECTION)),
+        "document_id": field("document_id", chunk.get("document_id", chunk.get("source", "document"))),
+        "document_type": field("document_type", chunk.get("document_type", "")),
+        "source": field("source", chunk.get("source", "")),
+        "page": int(chunk.get("page") if chunk.get("page") is not None else -1),
+        "clause_id": field("clause_id", chunk.get("clause_id", "")),
+        "parent_id": field("parent_id", chunk.get("parent_id", "")),
+        "child_text": field("child_text", chunk["child_text"]),
+        "parent_text": field("parent_text", chunk["parent_text"]),
+        "dense_vector": dense_vector,
+        "sparse_vector": sparse_vector,
+    }
+
+
+def index_chunks(chunks: list[dict], collection_name: str = COLLECTION) -> dict:
+    """Embed chunks and (re)build the target collection. Shared by the CLI and
+    the upload ingestion path. The collection is dropped and recreated, which is
+    exactly what we want for a per-document upload collection (re-upload replaces
+    only that document's own collection, never touching others)."""
+    if not chunks:
+        raise ValueError("No chunks to index.")
+
+    document_ids = _document_ids(chunks)
     bge = get_embedding_model()
+    texts = [chunk["child_text"] for chunk in chunks]
+    print(f"【阶段2】生成 dense + sparse embeddings... collection={collection_name}")
+    try:
+        embeddings = bge(texts)
+        _mark_documents(document_ids, embedding_status="success")
+    except Exception as exc:
+        _mark_documents(document_ids, embedding_status="failed", error=f"embedding failed: {exc}")
+        raise
 
-    # 一次性对所有子块编码，拿到稠密+稀疏两套向量
-    texts = [c["child_text"] for c in chunks]
-    print("【阶段2】编码中（同时产出 dense + sparse）…")
-    embeddings = bge(texts)   # dict: {"dense": ndarray, "sparse": csr_matrix}
     dense_vecs = embeddings["dense"]
     sparse_vecs = embeddings["sparse"]
     dense_dim = len(dense_vecs[0])
 
-    client = MilvusClient(uri=DB_PATH)
-    build_collection(client, dense_dim)
+    client = MilvusClient(uri=VECTOR_DB_URI)
+    build_collection(client, dense_dim, collection_name=collection_name)
 
-    # 组装入库数据
-    rows = []
-    for i, c in enumerate(chunks):
-        rows.append({
-            "id": c["id"],
-            "child_text": c["child_text"],
-            "parent_text": c["parent_text"],
-            "source": c["source"],
-            "dense_vector": dense_vecs[i],
-            "sparse_vector": sparse_vecs[[i]],   # 取第 i 行稀疏向量
-        })
+    rows = [
+        _row_from_chunk(chunk, dense_vecs[index], sparse_vecs[[index]])
+        for index, chunk in enumerate(chunks)
+    ]
 
-    client.insert(collection_name=COLLECTION, data=rows)
-    client.flush(COLLECTION)
-    print(f"  已插入 {len(rows)} 条数据到 Milvus Lite（{DB_PATH}）")
-    print("  阶段2 完成，可运行 stage3_search.py 测试检索。")
+    try:
+        client.insert(collection_name=collection_name, data=rows)
+        client.flush(collection_name)
+        _mark_documents(document_ids, milvus_insert_status="success")
+    except Exception as exc:
+        _mark_documents(document_ids, milvus_insert_status="failed", error=f"milvus insert failed: {exc}")
+        raise
 
-    # ───── 多集合扩展说明（面试可讲）─────
-    # 真实项目按险种隔离：重疾→collection_critical，医疗→collection_medical …
-    # 好处：1) 检索时按用户意图只查对应集合，减少干扰、提速
-    #       2) 不同险种字段/更新频率不同，分开管理更清晰
-    # 实现上就是把 COLLECTION 参数化，对每个险种各建一个集合即可。
+    print(f"  已插入 {len(rows)} 条数据到 Milvus：{VECTOR_DB_URI} / {collection_name}")
+    return {"collection": collection_name, "chunk_count": len(rows), "document_ids": document_ids}
+
+
+def main() -> None:
+    chunks = json.loads(CHUNKS_PATH.read_text(encoding="utf-8"))
+    print(f"【阶段2】读取 {len(chunks)} 个子块")
+    index_chunks(chunks, collection_name=COLLECTION)
+    print("  阶段2完成，可运行 stage3_search.py 测试检索。")
 
 
 if __name__ == "__main__":

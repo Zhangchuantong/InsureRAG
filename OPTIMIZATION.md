@@ -7,6 +7,7 @@
 InsureRAG 当前是一个本地 RAG 原型项目，已完成：
 
 - 真实保险 PDF 解析与文本清洗
+- PDF 文本层质量预检
 - 父子分块
 - BGE-M3 Dense/Sparse 混合检索
 - RRF 排名融合
@@ -16,11 +17,11 @@ InsureRAG 当前是一个本地 RAG 原型项目，已完成：
 
 但它还不是生产级系统。当前最值得优化的是检索质量、工程接口和评测实验体系。
 
-## P0：父块去重与上下文压缩
+## P0：父块去重与上下文压缩（已完成）
 
 ### 问题
 
-当前 Milvus 中存储的是子块，一个较长父条款会切出多个子块。检索后如果多个子块来自同一父条款，最终 `parent_text` 会重复进入上下文。
+当前 Milvus 中存储的是子块，一个较长父条款会切出多个子块。项目已在 Reranker 精排后按父块去重，避免多个子块对应同一 `parent_text` 时重复进入最终上下文。
 
 影响：
 
@@ -53,7 +54,7 @@ key = (source, parent_id)
 2. 插入数据时写入 `parent_id`。
 3. 在 `stage3_search.py` 中召回 Top 20。
 4. 对 Top 20 执行 Reranker。
-5. 按 `(source, parent_id)` 去重。
+5. 按 `(collection_name, document_id, parent_id)` 去重。
 6. 去重后取 Top 3 或 Top 5。
 
 ### 验收方式
@@ -432,7 +433,7 @@ Milvus 方案：
 
 ### 当前状态
 
-项目中已经实现 Query Rewrite 实验模块，但主问答和 RAGAS 评测链路默认未启用。
+项目曾包含一个独立的 Query Rewrite / 意图识别实验脚本（`stage5_intent.py`），但它从未接入主问答与 RAGAS 评测链路，已在瘦身时移除。这里保留为优化方向，下面给出真正落地时应采用的设计（双路检索而非直接替换原问题）。
 
 ### 为什么不能直接启用
 
@@ -528,34 +529,37 @@ Reranker
 
 > 企业知识库 RAG 必须做权限过滤，否则模型可能通过检索泄露用户无权访问的文档。
 
-## P2：Milvus Lite 迁移到 Milvus Server
+## P2：Milvus Standalone 工程化增强
 
 ### 当前状态
 
-当前使用 Milvus Lite，适合本地原型。
+当前已从 Milvus Lite 迁移到本地 Docker 部署的 Milvus Standalone。
 
-### 什么时候需要迁移
+项目默认连接：
+
+```python
+MilvusClient(uri="http://localhost:19530")
+```
+
+也可以通过环境变量 `MILVUS_URI` 覆盖连接地址。
+
+### 后续什么时候继续增强
 
 - 文档规模达到数万或百万级 chunk。
 - 多用户并发访问。
 - 需要远程部署。
 - 需要分区、副本、监控和权限管理。
 
-### 迁移方式
+### 后续增强方式
 
-代码层主要调整：
+已经完成：
 
-```python
-MilvusClient(uri=DB_PATH)
-```
+- 新增 `docker-compose.milvus.yml`，启动 Milvus Standalone、etcd、MinIO。
+- `stage2_build_db.py` 写入 Milvus Standalone。
+- `stage3_search.py` 从 Milvus Standalone 检索。
+- 使用 `MILVUS_URI` 支持不同部署地址。
 
-替换为：
-
-```python
-MilvusClient(uri="http://localhost:19530")
-```
-
-同时需要考虑：
+后续需要考虑：
 
 - collection schema 兼容
 - index 参数
@@ -565,7 +569,7 @@ MilvusClient(uri="http://localhost:19530")
 
 ### 面试表达
 
-> 当前数据规模小，所以使用 Milvus Lite 降低部署复杂度。生产化时可以平滑迁移到 Milvus Server，主要改连接地址和部署方式。
+> 当前项目已从 Milvus Lite 迁移到 Milvus Standalone，本地开发和生产部署形态更接近。后续如果数据规模或并发上升，可以继续补充分区、副本、备份、监控和压测。
 
 ## P2：前端页面
 
@@ -743,13 +747,20 @@ prompts/intent_v1.txt
 
 ## P3：更严格的 PDF 质量门禁
 
-### 问题
+### 当前状态
 
-当前只处理了重复文本层问题，还没有系统质量检测。
+当前已在 `stage1_load_split.py` 中加入基础质量预检：抽取前 3 页文本，计算有效字符率和文本密度。若文本质量很差，会进一步检测 PDF 前几页是否包含图片对象；疑似图片型 PDF 时使用 RapidOCR 识别后再进入分块流程。
 
-### 优化方案
+阈值策略：
 
-解析后检查：
+- 有效字符率 >= 0.80：质量较好，正常入库。
+- 0.60 <= 有效字符率 < 0.80：可入库，但打印警告，建议人工抽查。
+- 有效字符率 < 0.60：高风险，跳过该 PDF，建议转 OCR 或人工清洗。
+- 若高风险 PDF 的图片页占比 >= 0.50：判定为疑似图片型 PDF，触发 RapidOCR fallback。
+
+### 后续优化方案
+
+进一步可增加：
 
 - 中文字符比例
 - 乱码比例
@@ -761,7 +772,7 @@ prompts/intent_v1.txt
 
 ### 面试表达
 
-> 文档解析质量决定 RAG 上限。脏文本不能直接入库，必须先做质量门禁。
+> 文档解析质量决定 RAG 上限。当前我已经在入库前加入质量门禁，用有效字符率和文本密度过滤明显异常的 PDF；如果进一步判断为图片型 PDF，则走 RapidOCR fallback。后续可以继续加入乱码率、空页率和条款编号连续性检查。
 
 ## 总体优先级建议
 
@@ -778,7 +789,7 @@ prompts/intent_v1.txt
 | P2 | Query Rewrite A/B | 验证是否真的提升召回 |
 | P2 | 会话管理 | 支持多轮问答 |
 | P2 | 权限与安全 | 企业知识库必备 |
-| P2 | Milvus Server | 数据规模和并发上来后迁移 |
+| P2 | Milvus Standalone 工程化增强 | 补充备份、监控、压测与部署规范 |
 | P2 | 前端页面 | 提升演示效果 |
 | P2 | 部署与并发 | 生产化能力 |
 | P3 | Prompt 版本管理 | 方便实验复现 |
@@ -792,4 +803,3 @@ prompts/intent_v1.txt
 ## 面试总结话术
 
 > 这个项目已经完成 RAG 的核心闭环，但我不会把它包装成生产级系统。当前最优先的优化是父块去重和检索错误修复，其次是做检索消融实验、FastAPI 服务化和流式输出。如果要生产化，还需要多文档路由、权限隔离、日志监控、缓存、并发压测和更大规模评测集。
-

@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>InsureRAG · 保险条款问答</title>
+  <style>
+    :root { --bg:#0f172a; --card:#fff; --line:#e2e8f0; --muted:#64748b; --brand:#2563eb; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: -apple-system, "Segoe UI", Roboto, "Microsoft YaHei", sans-serif;
+           background:#f1f5f9; color:#0f172a; line-height:1.55; }
+    header { background:var(--bg); color:#fff; padding:18px 24px; }
+    header h1 { margin:0; font-size:20px; }
+    header p { margin:4px 0 0; color:#94a3b8; font-size:13px; }
+    main { max-width:880px; margin:24px auto; padding:0 16px; display:flex; flex-direction:column; gap:16px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px; }
+    .card h2 { margin:0 0 12px; font-size:15px; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    input[type=text], input[type=password], textarea, select {
+      width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; font:inherit; background:#fff; }
+    textarea { resize:vertical; min-height:64px; }
+    button { background:var(--brand); color:#fff; border:0; border-radius:8px; padding:10px 16px;
+             font:inherit; cursor:pointer; }
+    button.secondary { background:#e2e8f0; color:#0f172a; }
+    button:disabled { background:#94a3b8; cursor:not-allowed; }
+    .muted { color:var(--muted); font-size:13px; }
+    .pill { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; }
+    .pill.processing { background:#fef9c3; color:#854d0e; }
+    .pill.ready { background:#dcfce7; color:#166534; }
+    .pill.failed { background:#fee2e2; color:#991b1b; }
+    .pill.unknown { background:#e2e8f0; color:#475569; }
+    .doc { display:flex; align-items:center; gap:10px; padding:8px 0; border-top:1px solid var(--line); }
+    .doc:first-child { border-top:0; }
+    .doc .name { flex:1; font-size:14px; word-break:break-all; }
+    .answer { white-space:pre-wrap; background:#f8fafc; border:1px solid var(--line); border-radius:8px; padding:12px; }
+    .ev { border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-top:8px; }
+    .ev .meta { font-size:12px; color:var(--muted); margin-bottom:4px; }
+    .ev .txt { font-size:14px; }
+    .hidden { display:none; }
+    code { background:#f1f5f9; padding:1px 5px; border-radius:4px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>InsureRAG · 保险条款智能问答</h1>
+    <p>上传一份或多份保险条款 PDF，入库完成后选择文档进行提问。</p>
+  </header>
+
+  <main>
+    <div class="card">
+      <h2>① 配置（可选）</h2>
+      <div class="row">
+        <input type="password" id="apiKey" placeholder="X-API-Key（若服务端未开启鉴权可留空）" />
+      </div>
+      <p class="muted">仅当服务端 <code>api.auth_enabled=true</code> 时需要填写。</p>
+    </div>
+
+    <div class="card">
+      <h2>② 上传保险条款 PDF（可多选）</h2>
+      <div class="row">
+        <input type="file" id="file" accept="application/pdf" multiple />
+        <button id="uploadBtn">上传并入库</button>
+        <button id="refreshBtn" class="secondary">刷新列表</button>
+      </div>
+      <p class="muted">可一次选多个 PDF。每份会自动解析、分块、向量化并建立独立检索库，互不覆盖。</p>
+      <div id="docList" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="card">
+      <h2>③ 选择文档并提问</h2>
+      <div class="row">
+        <select id="docSelect"><option value="">（暂无已就绪的文档）</option></select>
+      </div>
+      <textarea id="question" placeholder="例如：等待期内生病了能赔吗？" style="margin-top:10px;"></textarea>
+      <div class="row" style="margin-top:10px;">
+        <button id="askBtn">提问</button>
+        <span class="muted" id="askMeta"></span>
+      </div>
+      <div id="result" class="hidden" style="margin-top:14px;">
+        <div class="answer" id="answer"></div>
+        <h3 style="font-size:14px;margin:14px 0 4px;">引用条款</h3>
+        <div id="evidence"></div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let pollTimer = null;
+
+    function headers(json) {
+      const h = {};
+      const key = $("apiKey").value.trim();
+      if (key) h["X-API-Key"] = key;
+      if (json) h["Content-Type"] = "application/json";
+      return h;
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    // --- document list + picker -------------------------------------------
+    async function refreshDocs() {
+      let docs = [];
+      try {
+        const r = await fetch("/api/uploads", { headers: headers(false) });
+        docs = (await r.json()).documents || [];
+      } catch (e) { return false; }
+
+      // status list
+      $("docList").innerHTML = docs.length ? docs.map((d) => `
+        <div class="doc">
+          <span class="pill ${d.status}">${d.status}</span>
+          <span class="name">${escapeHtml(d.document)}</span>
+          <span class="muted">${d.child_chunks != null ? d.child_chunks + " 块" : ""}</span>
+          ${d.deletable ? `<button class="secondary del" data-id="${escapeHtml(d.document_id)}" style="padding:4px 10px;">删除</button>` : ""}
+        </div>`).join("") : `<p class="muted">还没有上传任何文档。</p>`;
+      $("docList").querySelectorAll(".del").forEach((btn) => {
+        btn.onclick = async () => {
+          if (!confirm("确认删除该文档？将从向量库移除其检索数据，且不可恢复。")) return;
+          btn.disabled = true;
+          try {
+            const r = await fetch(`/api/uploads/${encodeURIComponent(btn.dataset.id)}`, { method: "DELETE", headers: headers(false) });
+            if (!r.ok) alert("删除失败：" + ((await r.json()).detail || r.statusText));
+          } catch (e) { alert("删除失败：" + e.message); }
+          refreshDocs();
+        };
+      });
+
+      // dropdown of ready docs (keep current selection if still present)
+      const ready = docs.filter((d) => d.status === "ready" && d.collection);
+      const prev = $("docSelect").value;
+      $("docSelect").innerHTML = ready.length
+        ? ready.map((d) => `<option value="${escapeHtml(d.collection)}">${escapeHtml(d.document)}${d.child_chunks != null ? "（" + d.child_chunks + " 块）" : ""}</option>`).join("")
+        : `<option value="">（暂无已就绪的文档）</option>`;
+      if (ready.some((d) => d.collection === prev)) $("docSelect").value = prev;
+
+      return docs.some((d) => d.status === "processing");
+    }
+
+    function startPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(async () => {
+        const stillProcessing = await refreshDocs();
+        if (!stillProcessing) { clearInterval(pollTimer); pollTimer = null; }
+      }, 2000);
+    }
+
+    // --- upload (multiple) -------------------------------------------------
+    $("uploadBtn").onclick = async () => {
+      const files = Array.from($("file").files || []);
+      if (!files.length) { alert("请先选择至少一个 PDF 文件"); return; }
+      $("uploadBtn").disabled = true;
+      try {
+        for (const f of files) {
+          const fd = new FormData();
+          fd.append("file", f);
+          try {
+            const r = await fetch("/api/upload", { method: "POST", headers: headers(false), body: fd });
+            if (!r.ok) console.warn("upload failed", f.name, (await r.json()).detail);
+          } catch (e) { console.warn("upload error", f.name, e); }
+        }
+        await refreshDocs();
+        startPolling();
+      } finally {
+        $("uploadBtn").disabled = false;
+      }
+    };
+
+    $("refreshBtn").onclick = () => refreshDocs();
+
+    // --- ask ---------------------------------------------------------------
+    $("askBtn").onclick = async () => {
+      const q = $("question").value.trim();
+      const collection = $("docSelect").value;
+      if (!q) return;
+      if (!collection) { alert("请先选择一个已就绪的文档"); return; }
+      $("askBtn").disabled = true;
+      $("askMeta").textContent = "检索 + 生成中…";
+      $("result").classList.add("hidden");
+      try {
+        const r = await fetch("/api/query", {
+          method: "POST",
+          headers: headers(true),
+          body: JSON.stringify({ question: q, collection }),
+        });
+        if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+        const data = await r.json();
+        $("answer").textContent = data.answer || "(无答案)";
+        const ev = $("evidence");
+        ev.innerHTML = "";
+        (data.evidence || []).forEach((e, i) => {
+          const div = document.createElement("div");
+          div.className = "ev";
+          const clause = e.clause_id || e.clause || "";
+          const page = (e.page ?? null) !== null ? `p.${e.page}` : "";
+          const score = e.score != null ? `score=${Number(e.score).toFixed(3)}` : "";
+          div.innerHTML = `<div class="meta">#${i + 1} ${escapeHtml(e.source || "")} ${escapeHtml(clause)} ${page} ${score}</div>
+                           <div class="txt">${escapeHtml((e.content || "").slice(0, 400))}</div>`;
+          ev.appendChild(div);
+        });
+        let meta = `trace=${(data.trace_id || "").slice(0, 8) || "-"} · ${Math.round(data.latency_ms)}ms · cache=${data.cache_type}`;
+        if (data.ttft_ms != null) meta += ` · 首字 ${Math.round(data.ttft_ms)}ms`;
+        if (data.tokens_per_sec != null) meta += ` · ${data.tokens_per_sec} tok/s`;
+        if (data.completion_tokens != null) meta += ` · 生成 ${data.completion_tokens} tok`;
+        $("askMeta").textContent = meta;
+        $("result").classList.remove("hidden");
+      } catch (e) {
+        $("answer").textContent = "查询失败：" + e.message;
+        $("evidence").innerHTML = "";
+        $("result").classList.remove("hidden");
+        $("askMeta").textContent = "";
+      } finally {
+        $("askBtn").disabled = false;
+      }
+    };
+
+    // populate from previously-uploaded docs on load
+    refreshDocs();
+  </script>
+</body>
+</html>

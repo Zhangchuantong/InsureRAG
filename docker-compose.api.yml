@@ -1,0 +1,22 @@
+name: insurerag-api
+
+# 仅示例如何把 API 跑在容器里。Milvus / Redis / vLLM 仍由它们各自的方式启动
+# （docker-compose.milvus.yml、docker-compose.redis.yml、宿主机 vLLM）。
+# 容器内的 localhost 指向容器自身，所以这里用 host.docker.internal 访问宿主机服务。
+services:
+  insurerag-api:
+    build: .
+    container_name: insurerag-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 访问宿主机上的 vLLM / Milvus / Redis（端口不变）。
+      INSURERAG_LLM_BASE_URL: http://host.docker.internal:8002/v1
+      INSURERAG_VECTOR_DB_HOST: host.docker.internal
+      INSURERAG_VECTOR_DB_PORT: "19530"
+      INSURERAG_CACHE_REDIS_URL: redis://host.docker.internal:6379/0
+      # 若 Redis 不可用，自动降级到本地 JSON 缓存，演示不至于因缓存挂掉。
+      INSURERAG_CACHE_FALLBACK_TO_JSON: "true"
+    extra_hosts:
+      # Windows/Mac 的 Docker Desktop 自带 host.docker.internal；Linux 需要这一行。
+      - "host.docker.internal:host-gateway"

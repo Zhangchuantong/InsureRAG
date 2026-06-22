@@ -1,162 +1,498 @@
 # InsureRAG - 保险条款智能问答系统
 
-InsureRAG 是一个面向保险条款解释与理赔咨询场景的本地 RAG 项目，覆盖 PDF 解析、父子分块、Dense/Sparse 混合检索、RRF 排名融合、CrossEncoder 重排序、本地大模型生成及 RAGAS 自动评测。
+InsureRAG 是面向保险条款解析与理赔规则问答的本地化 RAG 服务，支持 PDF 质量预检、OCR fallback、父子分块、BGE-M3 Dense/Sparse 混合检索、RRF 融合、BGE-Reranker 重排、vLLM/Qwen3 本地生成、FastAPI、MCP Server、Dashboard、Trace 和 RAGAS 评测。
 
-## 系统流程
+本项目定位为个人学习与面试展示项目，不宣称生产级准确率。
+
+## 系统架构
 
 ```text
-保险条款 PDF
-    |
-    v
-PDF 解析与文本清洗
-    |
-    v
-按“第 X 条”构建父块 + 约 200 字子块
-    |
-    v
-BGE-M3 Dense / Sparse 向量化
-    |
-    v
-Milvus Lite 双路召回 + RRF 融合
-    |
-    v
-BGE-Reranker 精排
-    |
-    v
-Qwen3-8B-AWQ 基于完整父条款生成答案
+PDF / 扫描件
+  -> PDF 质量预检
+  -> OCR fallback
+  -> 父子分块 + metadata enrichment
+  -> BGE-M3 Dense/Sparse Embedding
+  -> Milvus Standalone
+  -> Dense/Sparse Hybrid Retrieval
+  -> RRF 融合
+  -> BGE-Reranker 精排
+  -> Parent Dedup 父块去重
+  -> vLLM / Qwen3 本地生成
+  -> FastAPI / MCP Server
+  -> Dashboard / Trace / RAGAS Evaluation
 ```
-
-项目还包含意图识别与 Query Rewrite 实验模块。该模块位于 `stage5_intent.py`，当前基础问答与 RAGAS 主评测链路默认使用原始问题检索。
-
-## 核心实现
-
-### PDF 解析与父子分块
-
-- 使用 LangChain `PyPDFLoader` 解析保险条款 PDF。
-- 清理部分旧版 PDF 文本层中重复出现的标题和短语。
-- 按照“第 X 条”结构划分父块，保留完整条款语义。
-- 使用 `RecursiveCharacterTextSplitter` 生成约 200 字、重叠 30 字的检索子块。
-- 使用子块进行精确召回，命中后将完整父条款交给生成模型。
-
-对应文件：`stage1_load_split.py`
-
-### 混合检索与重排序
-
-- 使用 BGE-M3 同时生成 Dense 和 Sparse 向量。
-- 使用 Milvus Lite 保存文本、来源、父级条款及两类向量。
-- 分别执行 Dense/Sparse 检索，并通过 RRF 融合两路排名。
-- 召回 Top 20 候选后，使用 `BAAI/bge-reranker-base` CrossEncoder 精排。
-
-对应文件：`stage2_build_db.py`、`stage3_search.py`
-
-> Sparse 检索使用 BGE-M3 生成的稀疏向量，不是独立 BM25。
-
-### 本地答案生成
-
-- 使用 Docker 和 vLLM 部署 `Qwen/Qwen3-8B-AWQ`。
-- 通过 OpenAI-Compatible API 接入本地模型。
-- 关闭 Qwen3 thinking 输出，避免思考内容进入最终答案。
-- 使用结构化 Prompt 约束模型仅依据召回条款回答，证据不足时拒答并标注依据来源。
-
-对应文件：`stage4_generate.py`
-
-### RAGAS 自动评测
-
-- 基于真实保险条款整理 22 条参考问答样本。
-- 使用本地 Qwen3-8B 作为 RAGAS 裁判，BGE-M3 作为评测 Embedding。
-- 评估 Answer Correctness、Faithfulness、Answer Relevancy、Context Precision 和 Context Recall。
-- `RunConfig(max_workers=1)` 限制单卡并发，单项裁判解析失败时记录为 `NaN`，避免整轮评测中断。
-
-最近一次本地评测结果：
-
-| 指标 | 结果 | 有效样本 |
-| --- | ---: | ---: |
-| Answer Correctness | 0.7408 | 22/22 |
-| Faithfulness | 0.8596 | 19/22 |
-| Answer Relevancy | 0.8445 | 22/22 |
-| Context Precision | 0.9030 | 22/22 |
-| Context Recall | 1.0000 | 19/22 |
-| 平均端到端延迟 | 4.95 秒 | 22/22 |
-
-上述结果采集时裁判模型上下文为 4096 Token，部分 Faithfulness 和 Context Recall 样本因此未得到有效分数。当前部署已调整为 8192 Token，重新评测后应以最新结果为准。
-
-对应文件：`stage6_evaluate.py`
 
 ## 技术栈
 
-- Python、LangChain、PyPDF
-- PyMilvus、Milvus Lite
-- BGE-M3、BAAI/bge-reranker-base
-- Dense/Sparse 混合检索、RRF
-- Qwen3-8B-AWQ、vLLM、Docker
-- OpenAI-Compatible API、Prompt Engineering
-- RAGAS、Hugging Face Embeddings
+- Python 3.12
+- LangChain / PyPDFLoader
+- RapidOCR / ONNXRuntime / PyMuPDF
+- BGE-M3 Embedding
+- Milvus Standalone
+- RRF 排名融合
+- BGE-Reranker CrossEncoder
+- vLLM + Qwen3-8B-AWQ
+- OpenAI-Compatible API
+- FastAPI / MCP Server
+- RAGAS
+- pytest
+
+## 配置说明
+
+主要配置文件：
+
+- [config/config.yaml](config/config.yaml)
+- [.env.example](.env.example)
+
+配置优先级：
+
+```text
+内置默认值 < config/config.yaml < .env / 环境变量
+```
+
+常用配置：
+
+```text
+llm.base_url
+llm.model
+vector_db.host
+vector_db.port
+vector_db.collection
+retrieval.dense_top_k
+retrieval.sparse_top_k
+retrieval.final_top_k
+reranker.enabled
+ocr.enabled
+trace.output_dir
+api.port
+dashboard.port
+cache.enabled
+cache.backend
+cache.redis_url
+cache.semantic_direct_threshold
+cache.semantic_answer_threshold
+cache.semantic_retrieval_threshold
+```
+
+`.env.example` 不包含真实 API key。本地 vLLM 默认使用 `EMPTY` 占位。
 
 ## 环境准备
 
-建议使用 Python 3.11 或 3.12。
+安装 Python 依赖：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 启动 Qwen3
+建议使用项目当前环境：
 
-项目默认使用以下接口：
-
-```text
-BASE_URL=http://localhost:8002/v1
-MODEL=Qwen/Qwen3-8B-AWQ
+```bat
+D:\software\conda\envs\Agent_work\python.exe
 ```
 
-参考 Docker 命令：
+## 启动 Milvus
 
 ```bash
-docker run --gpus all --name vllm-qwen3-8b-awq \
-  -p 8002:8000 \
-  -v /path/to/huggingface-cache:/root/.cache/huggingface \
-  vllm/vllm-openai:latest \
-  --model Qwen/Qwen3-8B-AWQ \
-  --trust-remote-code \
-  --gpu-memory-utilization 0.85 \
+docker compose -f docker-compose.milvus.yml up -d
+```
+
+默认连接地址：
+
+```text
+http://localhost:19530
+```
+
+## 启动 Redis 缓存
+
+```bash
+docker compose -f docker-compose.redis.yml up -d
+```
+
+默认连接地址：
+
+```text
+redis://localhost:6379/0
+```
+
+如果 Redis 没有启动，且 `cache.fallback_to_json=true`，系统会自动退回 `data/cache.json`，保证 RAG 服务仍然可以运行。
+
+## 启动 vLLM / Qwen3
+
+项目默认使用：
+
+```text
+base_url: http://localhost:8002/v1
+model: Qwen/Qwen3-8B-AWQ
+```
+
+示例：
+
+```bash
+docker run --gpus all --name vllm-qwen3-8b-awq ^
+  -p 8002:8000 ^
+  -v /path/to/huggingface-cache:/root/.cache/huggingface ^
+  vllm/vllm-openai:latest ^
+  --model Qwen/Qwen3-8B-AWQ ^
+  --trust-remote-code ^
+  --gpu-memory-utilization 0.85 ^
   --max-model-len 8192
 ```
 
-Windows PowerShell 中需要根据本机环境调整换行符和 Hugging Face 缓存路径。
+## 文档入库
 
-## 运行方式
-
-1. 将有权使用的保险条款 PDF 放入 `data/`。
-2. 依次执行：
+把保险条款 PDF 放到 `data/` 目录，然后执行：
 
 ```bash
 python stage1_load_split.py
 python stage2_build_db.py
-python stage3_search.py
-python stage4_generate.py
+```
+
+> 注意：当前为**重建式入库**——`stage2_build_db.py` 每次运行都会 drop 并重建整个 collection，对全部文档重新索引，**不支持单文档增量插入/更新/删除**。这是为演示简化的取舍；生产级多文档管理需要按 `document_id` upsert 与局部重建。
+
+入库阶段会生成：
+
+- `data/chunks.json`
+- `traces/ingestion/*.json`
+
+ingestion trace 会记录：
+
+- document
+- parse_method
+- ocr_used
+- quality_score
+- text_density
+- page_count
+- parent_chunks
+- child_chunks
+- embedding_status
+- milvus_insert_status
+- warnings
+- error
+
+## 启动 FastAPI
+
+```bash
+python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+
+也可以构建 API 镜像：
+
+```bash
+docker build -t insurerag-api:latest .
+docker run --rm -p 8000:8000 --env-file .env insurerag-api:latest
+```
+
+或使用示例 compose：
+
+```bash
+docker compose -f docker-compose.api.yml up --build
+```
+
+接口文档：
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+### 两种运行方式与 Docker localhost 注意事项
+
+依赖地址（vLLM / Milvus / Redis）在两种运行方式下不一样：
+
+| 运行方式 | vLLM / Milvus / Redis 地址 |
+|---|---|
+| **本机直接 `python` 运行** | 用 `localhost`（默认配置即可，无需改动）|
+| **API 跑在 Docker 容器里、依赖在宿主机** | 用 `host.docker.internal` |
+| **API 与依赖在同一个 compose 网络** | 用各自的 service name（如 `redis`、`milvus-standalone`）|
+
+> ⚠️ **容器内的 `localhost` 指向容器自身，不是宿主机。** 如果 API 在容器里却用 `localhost:19530` 连 Milvus，会连到容器自己、必然失败。
+
+容器访问宿主机服务时这样覆盖（环境变量或 `.env`）：
+
+```env
+INSURERAG_LLM_BASE_URL=http://host.docker.internal:8002/v1
+INSURERAG_VECTOR_DB_HOST=host.docker.internal
+INSURERAG_CACHE_REDIS_URL=redis://host.docker.internal:6379/0
+```
+
+- **Windows / macOS**：Docker Desktop 自带 `host.docker.internal`，开箱即用。
+- **Linux**：需要给容器加 `--add-host=host.docker.internal:host-gateway`（`docker-compose.api.yml` 里已用 `extra_hosts` 配好）。
+
+`docker-compose.api.yml` 是一份只起 API 容器的示例，默认通过 `host.docker.internal` 访问宿主机上的 vLLM/Milvus/Redis；它**不改动** `docker-compose.milvus.yml` / `docker-compose.redis.yml` 的端口。
+
+### Web 界面（上传 + 问答）
+
+主 FastAPI app 内置了一个轻量前端（`web/index.html`），浏览器端通过 `fetch` 调用 `/api/*`，访问：
+
+```text
+http://127.0.0.1:8000/
+```
+
+流程：上传一份保险条款 PDF → 后台自动解析/分块/向量化并建立**独立检索库**（`upload_<hash>` collection）→ 入库完成后即可针对这份 PDF 问答。每份上传文档进入各自的 collection，互不影响（重新上传同一文件只重建它自己的 collection）。
+
+相关端点：
+
+```text
+POST /api/upload                          上传 PDF，后台异步入库，返回 document_id 与 collection
+GET  /api/upload/{document_id}/status     轮询入库状态（processing / ready / failed）
+POST /api/query  body 带 collection       针对指定 PDF 的 collection 问答
+```
+
+入库较慢（CPU 上 BGE-M3 向量化），前端通过状态轮询展示进度。若开启了鉴权，前端需在页面顶部填入 `X-API-Key`。
+
+### API 示例
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+`/health` 会检查 Redis、Milvus、vLLM、Embedding 和 Reranker 状态，并返回每个依赖的 `status`、耗时和错误码。其中 Embedding/Reranker 仅上报模型是否已加载（模型在首次查询时才懒加载），健康检查本身不会触发模型加载，保证探针轻量、可安全用于容器存活探测。
+
+如果开启 API Key 鉴权：
+
+```env
+INSURERAG_API_AUTH_ENABLED=true
+INSURERAG_API_KEY=your-private-api-key
+```
+
+业务接口需要带请求头：
+
+```text
+X-API-Key: your-private-api-key
+```
+
+`/health` 保持不鉴权，便于容器健康检查。
+
+检索 + 生成：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/query ^
+  -H "Content-Type: application/json" ^
+  -d "{\"question\":\"等待期内生病了能赔吗？\",\"collection\":\"insure_rag\",\"top_k\":5}"
+```
+
+只检索：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/search ^
+  -H "Content-Type: application/json" ^
+  -d "{\"question\":\"等待期内生病了能赔吗？\",\"collection\":\"insure_rag\",\"top_k\":5}"
+```
+
+查看查询 trace：
+
+```text
+GET /api/traces/{trace_id}
+```
+
+查看 ingestion trace：
+
+```text
+GET /api/ingestion-traces
+```
+
+查看聚合指标：
+
+```text
+GET /api/metrics
+```
+
+答案由 vLLM **流式生成**，因此每次查询都会采集生成性能指标：
+
+```text
+ttft_ms            首 token 延迟（第一个字吐出来用了多久）
+tokens_per_sec     输出吞吐（生成速度）
+prompt_tokens      输入 token 数
+completion_tokens  输出 token 数
+```
+
+单次查询的这些值直接出现在 `POST /api/query` 响应里；`GET /api/metrics` 还会聚合出 `avg_ttft_ms`、`p95_ttft_ms`、`avg_tokens_per_sec`、`avg_completion_tokens`、`avg_prompt_tokens`。缓存命中不经过生成，这些字段为空。
+
+## 缓存机制
+
+项目默认使用 Redis 缓存，并保留本地 JSON fallback：
+
+```text
+Redis: redis://localhost:6379/0
+
+JSON fallback: data/cache.json
+```
+
+## 可观测性与错误分类
+
+每次 `/api/query` 会写入请求级结构化日志，字段包括：
+
+```text
+trace_id, question, latency_ms, cache_hit, cache_type, retrieval_mode, rerank_mode, generation_mode, error_type
+```
+
+日志位置：
+
+```text
+logs/insurerag.log
+```
+
+查询 trace 默认持久化到 SQLite（`traces/traces.db`）；`GET /api/traces/{trace_id}`、`GET /api/metrics` 与 Dashboard 指标均由该库做索引查询 / 单次聚合，不再逐个 JSON 文件读盘。按配置自动清理：
+
+```yaml
+trace:
+  output_dir: traces
+  retention_days: 7   # 超过保留天数的 trace 会被删除
+  max_files: 1000     # 最多保留的 trace 条数（超出按时间裁剪）
+```
+
+ingestion trace（文档入库记录）仍以 JSON 形式保存在 `traces/ingestion/`。
+
+统一错误码包括：
+
+```text
+PDF_PARSE_ERROR
+OCR_ERROR
+MILVUS_SEARCH_ERROR
+RERANKER_ERROR
+LLM_TIMEOUT
+CACHE_ERROR
+```
+
+Redis is the preferred cache backend. The cache keeps exact answer cache,
+semantic answer cache, and semantic retrieval cache. If Redis is down and
+`cache.fallback_to_json=true`, the project automatically falls back to the
+local JSON cache so demos do not fail because of cache infrastructure.
+
+缓存分三层：
+
+1. Exact Answer Cache：规范化后一模一样的问题直接返回缓存答案。
+2. Semantic Answer Cache：相似度达到 `cache.semantic_direct_threshold`，且 collection、模型、top_k、检索配置一致，直接返回缓存答案。
+3. Semantic Retrieval Cache：相似度达到 `cache.semantic_retrieval_threshold` 但未达到直接答案阈值时，复用缓存证据并重新调用 LLM 生成。
+
+当相似度达到 `cache.semantic_answer_threshold` 时，系统会重新检索当前问题，并检查：
+
+- 证据 Jaccard overlap 是否达到 `cache.evidence_overlap_threshold`
+- top1 evidence 是否一致
+- 缓存答案是否为正常 LLM 生成
+- 缓存答案是否无 errors / fallback
+
+如果缓存中没有相似度大于 `cache.semantic_retrieval_threshold` 的问题，本次正常 RAG 完成后会自动写入语义缓存。
+
+API 返回会包含：
+
+```json
+{
+  "cache_hit": true,
+  "cache_type": "exact_answer",
+  "similarity": null,
+  "evidence_overlap": null
+}
+```
+
+## 启动 MCP Server
+
+MCP Server 使用 stdio 方式，适合被外部 Agent 调用：
+
+```bash
+python -m mcp_server.server
+```
+
+MCP tools：
+
+- `query_insurance_clause`
+- `search_related_clauses`
+- `get_clause_detail`
+- `list_documents`
+
+示例 MCP client 配置：
+
+```json
+{
+  "mcpServers": {
+    "insurerag": {
+      "command": "D:\\software\\conda\\envs\\Agent_work\\python.exe",
+      "args": ["-m", "mcp_server.server"],
+      "cwd": "D:\\code\\PythonProject\\InsureRAG"
+    }
+  }
+}
+```
+
+更多说明见 [MCP.md](MCP.md)。
+
+## 启动 Dashboard
+
+Dashboard 用于展示 Overview、Metrics、Document Browser 和 Query Trace：
+
+```bash
+python -m dashboard.app
+```
+
+默认地址：
+
+```text
+http://127.0.0.1:8001
+```
+
+## 运行测试
+
+安装测试依赖：
+
+```bash
+pip install pytest
+```
+
+运行 unit tests：
+
+```bash
+pytest tests/unit -q
+```
+
+运行全部测试：
+
+```bash
+pytest -q
+```
+
+测试包含：
+
+- PDF 质量预检
+- OCR fallback 触发条件
+- 父子分块 metadata
+- RRF 排名融合
+- Qwen thinking 过滤
+- 检索 fallback
+- FastAPI `/api/query` 响应结构
+- 缓存底层逻辑（归一化 / 余弦相似度 / 证据 Jaccard overlap / TTL / 语义匹配护栏）
+- 缓存三层路由（精确 / 语义直答 / 证据校验 / 语义检索复用 / miss）
+
+## RAGAS 评测
+
+评测集在 [eval/eval_set.json](eval/eval_set.json)，按文档分组、每组指定 `collection`。
+其中 CLI 入库的康宁用固定的 `insure_rag`；平安那份是网页上传的，`collection` 是文件名哈希
+（`upload_<hash>`）。**若重新上传平安或换了机器，需要把该组的 `collection` 改成实际值**；
+`stage6` 在跑前会校验 collection 是否存在，缺失时会醒目警告并跳过该组（不再静默 0 召回）。
+
+> 注：`llm.enable_thinking` 默认**关闭**（评测显示对抽取式条款问答质量基本无影响，但延迟约减半）。
+
+运行：
+
+```bash
 python stage6_evaluate.py
 ```
 
-| 脚本 | 功能 |
-| --- | --- |
-| `stage1_load_split.py` | PDF 解析、清洗与父子分块 |
-| `stage2_build_db.py` | 生成 Dense/Sparse 向量并写入 Milvus Lite |
-| `stage3_search.py` | 混合检索、RRF 融合与重排序 |
-| `stage4_generate.py` | 检索并生成最终答案 |
-| `stage5_intent.py` | 意图识别与 Query Rewrite 实验入口 |
-| `stage6_evaluate.py` | 本地 RAGAS 自动评测 |
+评测指标包括：
 
-如果 `data/` 中没有 PDF，`stage1_load_split.py` 会使用内置示例条款帮助验证基础流程。
+- Answer Correctness
+- Faithfulness
+- Answer Relevancy
+- Context Precision
+- Context Recall
 
-## 数据说明
+当前评测集规模有限，指标只能用于本地样本对比，不应夸大为生产准确率。
 
-保险条款 PDF、生成的 `chunks.json`、Milvus Lite 数据库和本地评测结果均被 `.gitignore` 排除，不会上传到公开仓库。
+## 项目限制
 
-请自行准备具有合法使用权限的 PDF，并重新运行 `stage1_load_split.py` 和 `stage2_build_db.py` 构建本地数据。
-
-## 当前限制
-
-- 当前为命令行原型，尚未提供 Web API、前端、会话管理和流式输出。
-- 尚未对父条款重复召回进行去重，较长条款可能重复占用 Top K。
-- Query Rewrite 尚未接入主问答和评测链路。
-- 评测集规模较小，指标仅用于项目迭代，不代表生产环境效果。
+- Milvus 使用本地 Standalone，不是生产集群。
+- 评测集规模有限，不能代表真实线上效果。
+- 仅提供单一 API Key 鉴权（`X-API-Key`），未包含多用户权限体系（RBAC）。
+- 尚未包含生产级监控、限流和并发压测。
+- Dashboard 是轻量本地展示，不是完整前端系统。
+- 多 collection / 多文档管理是基础能力，暂不包含复杂权限和生命周期管理。

@@ -1,0 +1,123 @@
+# InsureRAG 默认配置文件。
+# 配置优先级：内置默认值 < config/config.yaml < .env / 环境变量。
+# 本文件不要写真实云 API Key；本地 vLLM 可继续使用 EMPTY 占位。
+
+# 本地大模型配置。当前项目通过 vLLM 的 OpenAI-Compatible API 调用 Qwen3。
+llm:
+  # 模型服务提供方，当前为本地 vLLM。
+  provider: vllm
+  # vLLM OpenAI-Compatible API 地址；不要随意改端口，除非你的容器映射也改了。
+  base_url: http://localhost:8002/v1
+  # vLLM 启动时加载的模型名。
+  model: Qwen/Qwen3-8B-AWQ
+  # 本地 vLLM 默认不校验 key，使用 EMPTY 占位即可。
+  api_key: EMPTY
+  # 生成随机性；保险问答建议偏低，保证答案稳定。
+  temperature: 0.2
+  # 最大输出 token。开启 thinking 后建议不要太小，避免答案被截断。
+  max_tokens: 1024
+  timeout_seconds: 60
+  health_timeout_seconds: 3
+  # 是否开启 Qwen3 thinking；业务代码会过滤 <think>...</think>，最终不展示思考过程。
+  enable_thinking: false
+
+# Embedding 配置。BGE-M3 同时输出 Dense 和 Sparse 向量。
+embedding:
+  provider: bge_m3
+  # 模型名称或本地模型路径；首次运行会使用 Hugging Face 缓存。
+  model_path: BAAI/bge-m3
+  # 当前默认 CPU，若本机 GPU 环境可用可改为 cuda。
+  device: cpu
+  # CPU 下建议 false；GPU 推理可考虑 true。
+  use_fp16: false
+  # true 表示只使用本地 Hugging Face 缓存，避免服务启动时联网下载模型。
+  local_files_only: true
+
+# 向量数据库配置。当前使用 Docker 部署的 Milvus Standalone。
+vector_db:
+  provider: milvus
+  # Milvus 服务地址。
+  host: localhost
+  # Milvus gRPC/HTTP 连接端口。
+  port: 19530
+  # 存储保险条款 chunk 和向量的 collection 名。
+  collection: insure_rag
+
+# 检索配置。先 Dense/Sparse 双路召回，再用 RRF 融合，最后 reranker 精排。
+retrieval:
+  # Dense 语义召回候选数。
+  dense_top_k: 20
+  # Sparse 关键词召回候选数。
+  sparse_top_k: 20
+  # 最终返回给生成模型的上下文数量。
+  final_top_k: 5
+  # RRF 融合平滑参数，常用默认值为 60。
+  rrf_k: 60
+
+# 重排序配置。使用 CrossEncoder 对召回候选做精排。
+reranker:
+  # false 时跳过 reranker，直接使用 RRF 结果。
+  enabled: true
+  # 交叉编码器模型名或本地路径。
+  model: BAAI/bge-reranker-base
+  device: cpu
+  local_files_only: true
+
+# OCR 与 PDF 质量预检配置。
+ocr:
+  # 是否启用 OCR fallback；仅在 PDF 文本层质量很差且疑似图片型 PDF 时触发。
+  enabled: true
+  # 有效字符率低于该阈值时判定为高风险文本层。
+  fallback_threshold: 0.6
+  # 有效字符率高于该阈值时认为文本层质量较好。
+  good_threshold: 0.8
+  # 平均每页有效字符数低于该值时，疑似扫描件或空文本层。
+  min_text_density: 100
+  # 质量预检抽样页数。
+  sample_pages: 3
+  # 高风险 PDF 中图片页占比超过该阈值时，判定为疑似图片型 PDF。
+  image_page_ratio_threshold: 0.5
+
+# Trace 配置。后续 Dashboard / 可观测性功能会使用这里的输出目录。
+trace:
+  enabled: true
+  output_dir: traces
+  retention_days: 7
+  max_files: 1000
+
+# API 服务配置。
+api:
+  host: 0.0.0.0
+  port: 8000
+  auth_enabled: false
+  api_key: ""
+  # 上传 PDF 的大小上限(MB)；超过返回 413。可用 INSURERAG_API_MAX_UPLOAD_MB 覆盖。
+  max_upload_mb: 50
+  # 允许的上传文件扩展名（小写）。
+  allowed_upload_extensions:
+    - .pdf
+  # 网页上传文档数量上限（防止 collection / 本地文件无限累积）；新增文档超过时返回 400。
+  max_uploaded_documents: 20
+
+# Dashboard 服务配置。FastAPI 主服务仍使用 api.port，这里单独给可观测页面使用。
+dashboard:
+  host: 0.0.0.0
+  port: 8001
+
+# 缓存配置：默认使用 Redis；Redis 不可用时可退回本地 JSON。
+cache:
+  enabled: true
+  backend: redis
+  path: data/cache.json
+  redis_url: redis://localhost:6379/0
+  redis_prefix: insurerag:cache
+  fallback_to_json: true
+  ttl_seconds: 86400
+  answer_cache: true
+  search_cache: true
+  semantic_cache: true
+  semantic_direct_threshold: 0.98
+  semantic_answer_threshold: 0.95
+  semantic_retrieval_threshold: 0.93
+  evidence_overlap_threshold: 0.6
+  require_top1_evidence_match: true

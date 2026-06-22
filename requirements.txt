@@ -1,12 +1,38 @@
+# 向量库 + BGE-M3 Dense/Sparse Embedding（间接带入 onnxruntime / datasets）
 pymilvus[model]
-langchain
+
+# 文档加载与父子分块
 langchain-community
 langchain-text-splitters
-sentence-transformers
 pypdf
+
+# Reranker（CrossEncoder 精排）
+sentence-transformers
+
+# LLM 客户端（vLLM OpenAI-Compatible API）
 openai
+
+# PDF 质量预检 + OCR fallback
+pymupdf
+rapidocr
+onnxruntime          # rapidocr 运行时后端，rapidocr 未声明该依赖，显式保留
+
+# RAGAS 评测
 ragas
-datasets
 langchain-openai
 langchain-huggingface
 
+# 配置
+PyYAML
+
+# API / MCP 服务
+fastapi
+uvicorn
+python-multipart          # FastAPI 文件上传(UploadFile)所需
+mcp
+
+# 缓存
+redis
+
+# 测试
+pytest
